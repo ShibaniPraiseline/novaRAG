@@ -1,0 +1,15 @@
+{
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.autoImportCompletions": false,
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.memory.keepLibraryAst": false,
+  "python.analysis.indexing": false,
+  "python.analysis.exclude": [
+    "**/venv/**",
+    "**/site-packages/**",
+    "**/torch/**",
+    "**/transformers/**",
+    "**/sentence_transformers/**",
+    "**/whisper/**"
+  ]
+}

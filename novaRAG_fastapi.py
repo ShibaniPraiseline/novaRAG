@@ -1,328 +1,218 @@
-"""
-Offline Multimodal RAG - FastAPI Prototype with Ollama Llama-3
-"""
-
+# ================= IMPORTS =================
 import os
-import io
 import uuid
-import json
-import sqlite3
-from typing import List
-from pathlib import Path
-
-import numpy as np
 import faiss
-import torch
-
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse
-
-from sentence_transformers import SentenceTransformer
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
-import pytesseract
-import fitz  # PyMuPDF
-from docx import Document
 import whisper
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+from PIL import Image
+import fitz  # PyMuPDF
+import docx2txt
+import pytesseract
 
-# Ollama (local LLM)
-from ollama import chat
+# Tesseract path (Windows)
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# ================= INIT =================
+app = FastAPI()
 
-# ================= CONFIG =================
-DATA_DIR = Path("data_store")
-DATA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-INDEX_FILE = DATA_DIR / "faiss_index.bin"
-META_DB = DATA_DIR / "metadata.db"
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+llm = pipeline("text2text-generation", model="google/flan-t5-base", max_length=512)
+whisper_model = whisper.load_model("base")
 
-EMBED_DIM = 512
-CHUNK_SIZE = 800
-OVERLAP = 120
-TOP_K = 8
+dimension = 384
+index = faiss.IndexFlatL2(dimension)
+metadata_store = []
 
+SYSTEM_PROMPT = """
+You are a strict document assistant.
 
-# ================= LOAD MODELS =================
-print("Loading models...")
+Rules:
+1) Answer ONLY from the provided context
+2) If answer not found → say:
+   "The answer is not present in the provided sources."
+3) Do NOT use outside knowledge
+"""
 
-text_encoder = SentenceTransformer("all-mpnet-base-v2")
+# ================= HELPERS =================
 
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-whisper_model = whisper.load_model("small")
-
-text_dim = text_encoder.get_sentence_embedding_dimension()
-text_proj = torch.nn.Linear(text_dim, EMBED_DIM) if text_dim != EMBED_DIM else None
-
-clip_text_dim = clip_model.text_model.config.hidden_size
-clip_proj = torch.nn.Linear(clip_text_dim, EMBED_DIM) if clip_text_dim != EMBED_DIM else None
-
-
-# ================= FAISS =================
-if INDEX_FILE.exists():
-    index = faiss.read_index(str(INDEX_FILE))
-else:
-    quantizer = faiss.IndexFlatIP(EMBED_DIM)
-    index = faiss.IndexIVFFlat(quantizer, EMBED_DIM, 100, faiss.METRIC_INNER_PRODUCT)
-    index.nprobe = 10
+def embed(text: str):
+    return embedder.encode([text])[0]
 
 
-# ================= METADATA DB =================
-conn = sqlite3.connect(META_DB, check_same_thread=False)
-cur = conn.cursor()
+def add_to_index(text: str, filename: str, page=None):
+    vec = embed(text)
+    index.add(np.array([vec]).astype("float32"))
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS docs (
-    id TEXT PRIMARY KEY,
-    source_path TEXT,
-    source_type TEXT,
-    snippet TEXT,
-    page INTEGER,
-    start_sec REAL,
-    end_sec REAL,
-    extra JSON
-)
-""")
-conn.commit()
+    metadata_store.append({
+        "id": str(uuid.uuid4()),
+        "text": text,
+        "path": filename,
+        "page": page
+    })
 
 
-# ================= UTILS =================
-def chunk_text(text):
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i + CHUNK_SIZE])
-        i += CHUNK_SIZE - OVERLAP
-    return chunks
+def search(query: str, k: int = 5):
+    if index.ntotal == 0:
+        return []
 
-
-def normalize(x):
-    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-10)
-
-
-def embed_text_list(texts: List[str]) -> np.ndarray:
-    emb = text_encoder.encode(texts, convert_to_numpy=True)
-    emb = torch.tensor(emb)
-    if text_proj:
-        emb = text_proj(emb)
-    return normalize(emb.detach().cpu().numpy())
-
-
-def embed_image(data) -> np.ndarray:
-    if isinstance(data, bytes):
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-    else:
-        img = Image.open(data).convert("RGB")
-
-    inputs = clip_processor(images=img, return_tensors="pt")
-    with torch.no_grad():
-        emb = clip_model.get_image_features(**inputs)
-
-    if clip_proj:
-        emb = clip_proj(emb)
-
-    return normalize(emb.detach().cpu().numpy())
-
-
-def save_index():
-    faiss.write_index(index, str(INDEX_FILE))
-
-
-def upsert_meta(uid, path, stype, snippet=None, page=None, s=None, e=None):
-    cur.execute("""
-    INSERT OR REPLACE INTO docs VALUES (?,?,?,?,?,?,?,?)
-    """, (uid, path, stype, snippet, page, s, e, json.dumps({})))
-    conn.commit()
-
-
-# ================= INGEST =================
-def ingest_pdf(data, name):
-    path = DATA_DIR / f"{uuid.uuid4()}_{name}"
-    path.write_bytes(data)
-
-    doc = fitz.open(path)
-    vectors = []
-
-    for pno in range(len(doc)):
-        page = doc.load_page(pno)
-        text = page.get_text()
-        for chunk in chunk_text(text):
-            uid = str(uuid.uuid4())
-            emb = embed_text_list([chunk])[0]
-            vectors.append(emb)
-            upsert_meta(uid, str(path), "pdf", chunk[:300], pno + 1)
-
-    if vectors:
-        arr = np.array(vectors).astype("float32")
-        if not index.is_trained:
-            index.train(arr)
-        index.add(arr)
-        save_index()
-
-    return {"status": "PDF ingested"}
-
-
-def ingest_docx(data, name):
-    path = DATA_DIR / f"{uuid.uuid4()}_{name}"
-    path.write_bytes(data)
-
-    doc = Document(path)
-    text = "\n".join(p.text for p in doc.paragraphs)
-
-    vectors = []
-    for chunk in chunk_text(text):
-        uid = str(uuid.uuid4())
-        emb = embed_text_list([chunk])[0]
-        vectors.append(emb)
-        upsert_meta(uid, str(path), "docx", chunk[:300])
-
-    if vectors:
-        arr = np.array(vectors).astype("float32")
-        if not index.is_trained:
-            index.train(arr)
-        index.add(arr)
-        save_index()
-
-    return {"status": "DOCX ingested"}
-
-
-def ingest_image(data, name):
-    path = DATA_DIR / f"{uuid.uuid4()}_{name}"
-    path.write_bytes(data)
-
-    ocr = pytesseract.image_to_string(Image.open(path))
-    vectors = []
-
-    if ocr.strip():
-        for chunk in chunk_text(ocr):
-            uid = str(uuid.uuid4())
-            emb = embed_text_list([chunk])[0]
-            vectors.append(emb)
-            upsert_meta(uid, str(path), "image_ocr", chunk[:300])
-
-    img_emb = embed_image(path)[0]
-    vectors.append(img_emb)
-    upsert_meta(str(uuid.uuid4()), str(path), "image")
-
-    arr = np.array(vectors).astype("float32")
-    if not index.is_trained:
-        index.train(arr)
-    index.add(arr)
-    save_index()
-
-    return {"status": "Image ingested"}
-
-
-def ingest_audio(data, name):
-    path = DATA_DIR / f"{uuid.uuid4()}_{name}"
-    path.write_bytes(data)
-
-    res = whisper_model.transcribe(str(path))
-    vectors = []
-
-    for seg in res["segments"]:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        uid = str(uuid.uuid4())
-        emb = embed_text_list([text])[0]
-        vectors.append(emb)
-        upsert_meta(uid, str(path), "audio", text[:300], None, seg["start"], seg["end"])
-
-    if vectors:
-        arr = np.array(vectors).astype("float32")
-        if not index.is_trained:
-            index.train(arr)
-        index.add(arr)
-        save_index()
-
-    return {"status": "Audio ingested"}
-
-
-# ================= QUERY =================
-def search(query):
-    q_emb = embed_text_list([query])
-    D, I = index.search(q_emb.astype("float32"), TOP_K)
-
-    cur.execute("SELECT id FROM docs")
-    all_ids = [r[0] for r in cur.fetchall()]
-
-    matched = [all_ids[i] for i in I[0] if i < len(all_ids)]
+    qvec = embed(query)
+    distances, labels = index.search(np.array([qvec]).astype("float32"), k)
 
     results = []
-    for mid in matched:
-        cur.execute("SELECT * FROM docs WHERE id=?", (mid,))
-        row = cur.fetchone()
-        if row:
+    for i in labels[0]:
+        if 0 <= i < len(metadata_store):
+            item = metadata_store[i]
             results.append({
-                "path": row[1],
-                "type": row[2],
-                "snippet": row[3],
-                "page": row[4]
+                "snippet": item["text"],
+                "path": item["path"],
+                "page": item["page"]
             })
-
     return results
 
 
-def call_llm(prompt):
-    res = chat(
-        model="llama3",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return res["message"]["content"]
+def build_context(docs):
+    parts = []
+    for d in docs:
+        src = f"[{d.get('path','Unknown')}]"
+        if d.get("page"):
+            src += f" (page {d['page']})"
+        parts.append(f"{src} {d.get('snippet','')}")
+    return "\n\n".join(parts)
 
 
-def build_prompt(q, docs):
-    ctx = "\n".join(
-        f"[{i+1}] {d['snippet']}" for i, d in enumerate(docs)
-    )
-
+def build_prompt(context: str, question: str):
     return f"""
-You are an offline RAG assistant.
-Answer ONLY from the sources.
-If answer not found, say: I don't know.
+{SYSTEM_PROMPT}
 
-Question: {q}
+CONTEXT:
+{context}
 
-Sources:
-{ctx}
+QUESTION:
+{question}
+
+ANSWER:
 """
 
 
-# ================= FASTAPI =================
-app = FastAPI(title="Offline Multimodal RAG")
+# 🔥 FIXED LLM OUTPUT NORMALIZER
+def call_llm(prompt: str) -> str:
+    output = llm(prompt)
+
+    if isinstance(output, list):
+        first = output[0]
+        if isinstance(first, dict) and "generated_text" in first:
+            return str(first["generated_text"])
+        if isinstance(first, str):
+            return first
+
+    if isinstance(output, dict):
+        return str(output.get("generated_text", ""))
+
+    return str(output)
+
+
+def clean_answer(ans: str):
+    return ans.strip()
+
+
+def grounded_check(answer: str, context: str):
+    answer_words = set(answer.lower().split())
+    context_words = set(context.lower().split())
+
+    overlap = len(answer_words & context_words) / max(len(answer_words), 1)
+
+    if overlap < 0.30:
+        return "The answer is not present in the provided sources."
+
+    return answer
+
+
+# ================= INGEST =================
 
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
-    data = await file.read()
+
+    if not file.filename:
+        return {"status": "Invalid file"}
+
+    save_path = os.path.join(UPLOAD_DIR, file.filename)
+
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    ingested_chunks = 0
     ext = file.filename.lower()
 
+    # -------- PDF --------
     if ext.endswith(".pdf"):
-        return ingest_pdf(data, file.filename)
-    if ext.endswith(".docx"):
-        return ingest_docx(data, file.filename)
-    if ext.endswith((".png", ".jpg", ".jpeg")):
-        return ingest_image(data, file.filename)
-    if ext.endswith((".wav", ".mp3", ".m4a")):
-        return ingest_audio(data, file.filename)
+        doc = fitz.open(save_path)
+        for page_index in range(len(doc)):
+            page = doc.load_page(page_index)
+            text = page.get_text("text")
+            for chunk in text.split("\n"):
+                if chunk.strip():
+                    add_to_index(chunk.strip(), file.filename, page_index + 1)
+                    ingested_chunks += 1
 
-    return JSONResponse({"error": "Unsupported format"}, 400)
+    # -------- DOCX --------
+    elif ext.endswith(".docx"):
+        text = docx2txt.process(save_path) or ""
+        for chunk in text.split("\n"):
+            if chunk.strip():
+                add_to_index(chunk.strip(), file.filename)
+                ingested_chunks += 1
 
+    # -------- IMAGE --------
+    elif ext.endswith((".png", ".jpg", ".jpeg")):
+        img = Image.open(save_path)
+        text = pytesseract.image_to_string(img) or ""
+        for chunk in text.split("\n"):
+            if chunk.strip():
+                add_to_index(chunk.strip(), file.filename)
+                ingested_chunks += 1
+
+    # -------- AUDIO --------
+    elif ext.endswith((".mp3", ".wav", ".m4a")):
+        result = whisper_model.transcribe(save_path)
+        text = str(result.get("text", ""))
+        for chunk in text.split("."):
+            if chunk.strip():
+                add_to_index(chunk.strip(), file.filename)
+                ingested_chunks += 1
+
+    else:
+        return {"status": "Unsupported file"}
+
+    return {"status": "File indexed successfully", "ingested": ingested_chunks}
+
+
+# ================= QUERY =================
 
 @app.post("/query")
 async def query(q: str = Form(...)):
+
     docs = search(q)
-    prompt = build_prompt(q, docs)
-    answer = call_llm(prompt)
-    return {"answer": answer, "sources": docs}
 
+    if not docs:
+        return {
+            "answer": "The answer is not present in the provided sources.",
+            "citations": []
+        }
 
-@app.get("/status")
-def status():
-    return {"vectors": index.ntotal, "trained": index.is_trained}
+    context = build_context(docs)
+    prompt = build_prompt(context, q)
 
+    raw_answer = call_llm(prompt)
+    cleaned = clean_answer(raw_answer)
+    answer = grounded_check(cleaned, context)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {
+        "answer": answer,
+        "citations": docs
+    }

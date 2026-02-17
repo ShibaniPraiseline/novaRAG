@@ -8,6 +8,10 @@ API_URL = "http://127.0.0.1:8000"
 st.set_page_config(page_title="NovaRAG Offline Multimodal RAG", layout="wide")
 st.title("NovaRAG Offline Multimodal RAG")
 
+# session memory
+if "history" not in st.session_state:
+    st.session_state.history = []
+
 # --------------------------
 # 1️⃣ File Ingestion
 # --------------------------
@@ -29,55 +33,69 @@ if uploaded_file:
                     "file": (uploaded_file.name, uploaded_file.getvalue())
                 }
 
-                resp = requests.post(f"{API_URL}/ingest", files=files)
+                resp = requests.post(f"{API_URL}/ingest", files=files, timeout=300)
                 resp.raise_for_status()
 
                 data = resp.json()
-                st.success(f"✅ File ingested successfully! Chunks ingested: {data.get('ingested', 0)}")
+                st.success("✅ File ingested successfully!")
+
+                if "chunks" in data:
+                    st.caption(f"Indexed chunks: {data['chunks']}")
 
             except requests.exceptions.ConnectionError:
-                st.error("❌ Cannot connect to backend. Is FastAPI running on port 8000?")
-            except requests.exceptions.JSONDecodeError:
-                st.error("❌ Backend did not return valid JSON.")
+                st.error("❌ Cannot connect to backend. Start FastAPI first.")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
 
 # --------------------------
-# 2️⃣ Ask a Question
+# 2️⃣ Chat Interface
 # --------------------------
-st.header("2️⃣ Ask a Question")
+st.header("2️⃣ Ask Questions")
 
-question = st.text_input("Type your question about the ingested documents:")
+question = st.chat_input("Ask anything about your documents...")
 
-if st.button("Get Answer") and question.strip():
-    with st.spinner("Fetching answer..."):
+if question:
+    st.session_state.history.append(("user", question))
+
+    with st.spinner("Thinking..."):
         try:
             resp = requests.post(
                 f"{API_URL}/query",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded"
-                },
-                data=f"q={question}",
-                timeout=120
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={"q": question},
+                timeout=180
             )
 
             resp.raise_for_status()
             data = resp.json()
 
-            st.subheader("💬 Answer")
-            st.markdown(data.get("answer", "No answer returned."))
+            answer = data.get("answer", "No answer returned.")
+            citations = data.get("citations", [])
 
-            st.subheader("📄 Citations / Sources")
-            for c in data.get("citations", []):
-                file_name = Path(c["path"]).name
-                page_no = c.get("page", "N/A")
-                with st.expander(f"{file_name} (page {page_no})"):
-                    st.write(c.get("snippet", ""))
+            st.session_state.history.append(("assistant", answer, citations))
 
-        except requests.exceptions.ConnectionError:
-            st.error("❌ Cannot connect to backend. Is FastAPI running?")
-        except requests.exceptions.HTTPError as e:
-            st.error(f"❌ Backend error: {e.response.status_code}")
-            st.text(e.response.text)
         except Exception as e:
-            st.error(f"❌ Error: {e}")
+            st.session_state.history.append(("assistant", f"Error: {e}", []))
+
+# --------------------------
+# Conversation Display
+# --------------------------
+for item in st.session_state.history:
+    if item[0] == "user":
+        with st.chat_message("user"):
+            st.markdown(item[1])
+
+    else:
+        with st.chat_message("assistant"):
+            st.markdown(item[1])
+
+            citations = item[2]
+            if citations:
+                st.markdown("**Sources:**")
+                for c in citations:
+                    file_name = Path(c.get("path", "Unknown")).name
+                    page_no = c.get("page", "N/A")
+                    snippet = c.get("snippet", "")
+
+                    with st.expander(f"{file_name} (page {page_no})"):
+                        st.write(snippet)
