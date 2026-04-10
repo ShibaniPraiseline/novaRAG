@@ -65,11 +65,34 @@ if image_query:
                     results = data.get("results", [])
 
                     if results:
-                        for r in results:
-                            st.image(f"{API_URL}/document/{Path(r['path']).name}")
-                            st.caption(f"Score: {r['score']:.2f}")
+                        img_results  = [r for r in results if r.get("type") == "image"]
+                        text_results = [r for r in results if r.get("type") == "text"]
+                        audio_results= [r for r in results if r.get("type") == "audio"]
+
+                        if img_results:
+                            st.markdown("**Matching images**")
+                            for r in img_results:
+                                st.image(f"{API_URL}/document/{Path(r['path']).name}")
+                                st.caption(f"Score: {r['score']:.2f}")
+
+                        if text_results:
+                            st.markdown("**Matching text passages**")
+                            for r in text_results:
+                                fname = Path(r['path']).name
+                                page  = r.get('page', 'N/A')
+                                with st.expander(f"{fname} — page {page} (score {r['score']:.2f})"):
+                                    st.write(r.get("snippet", ""))
+                                    st.markdown(f"[⬇ Open document]({API_URL}/document/{fname})")
+                        
+                        if audio_results:
+                            st.markdown("**Matching audio segments**")
+                            for r in audio_results:
+                                fname = Path(r['path']).name
+                                ts    = int(r.get("timestamp", 0))
+                                st.audio(f"{API_URL}/document/{fname}", start_time=ts)
+                                st.caption(f"{fname} — starts at {ts}s (score {r['score']:.2f})")
                     else:
-                        st.info("No matching images found")
+                        st.info("No matching results found")
                 except Exception as e:
                     st.error(f"Error: {e}")
 audio_file = st.file_uploader("Upload audio to play", type=["mp3","wav"])
@@ -157,7 +180,8 @@ if question:
                 "citations": citations,
                 "confidence": confidence,
                 "chunks_used": chunks_used,
-                "trace": trace
+                "trace": trace,
+                "linked_sources": data.get("linked_sources", [])
             })
 
         except Exception as e:
@@ -194,7 +218,10 @@ for item in st.session_state.history:
 
                 for c in citations:
                     score = c.get("score", 0)
-                    st.progress(min(max(score, 0), 1))
+                    try:
+                        st.progress(float(min(max(score, 0), 1)))
+                    except:
+                        pass
                     key = (c.get("path"), c.get("page"))
 
                     if key in seen:
@@ -219,7 +246,7 @@ for item in st.session_state.history:
                         snippet = re.sub(f"({safe_q})", r"**\1**", snippet, flags=re.IGNORECASE)
 
                     with st.expander(f"{file_name} (page {page_no})"):
-                        st.write(snippet)
+                        st.text(snippet)   # ← st.text instead of st.write — no markdown rendering
                         doc_url = f"{API_URL}/document/{file_name}"
                         st.markdown(f"[⬇ Download Source Document]({doc_url})")
 
@@ -230,5 +257,19 @@ for item in st.session_state.history:
                     st.write(
                         f"📄 {t['file']} | Page: {t['page']} | Chunk: {t['chunk_id']} | Score: {t['score']}"
                     )  
+
+            linked = item.get("linked_sources", [])
+            if linked:
+                st.markdown("**Cross-modal Links:**")
+                for lnk in linked:
+                    icon = "🔗"
+                    if lnk["type"] == "text↔audio":
+                        ts = f" @ {lnk['audio_timestamp']}s" if lnk.get("audio_timestamp") else ""
+                        st.info(f"{icon} **Text↔Audio** — `{Path(lnk['text_source']).name}` (page {lnk.get('text_page','?')}) linked to `{Path(lnk['audio_source']).name}`{ts}")
+                    elif lnk["type"] == "text↔image":
+                        st.info(f"{icon} **Text↔Image** — `{Path(lnk['text_source']).name}` (page {lnk.get('text_page','?')}) linked to `{Path(lnk['image_source']).name}`")
+                    elif lnk["type"] == "audio↔image":
+                        ts = f" @ {lnk['audio_timestamp']}s" if lnk.get("audio_timestamp") else ""
+                        st.info(f"{icon} **Audio↔Image** — `{Path(lnk['audio_source']).name}`{ts} linked to `{Path(lnk['image_source']).name}`")
 
                             

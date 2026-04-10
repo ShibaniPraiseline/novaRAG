@@ -25,7 +25,6 @@ from transformers import CLIPProcessor, CLIPModel
 import torch
 import requests
 from typing import Any
-from collections import Counter
 
 # ================= MEMORY =================
 conversation_memory = []
@@ -518,30 +517,18 @@ def hybrid_search(query, k=5, image_path=None, file_filter=None):
     
 
 
-def build_prompt(context: str, question: str, sources: list):
-    """
-    sources: list of dicts with keys 'num', 'path', 'page'
-    Instructs the LLM to embed [1], [2] inline markers.
-    """
-    source_legend = "\n".join(
-        f"[{s['num']}] {s['path']}" + (f" (page {s['page']})" if s.get('page') else "")
-        for s in sources
-    )
-
+def build_prompt(context: str, question: str):
     return f"""
 {SYSTEM_PROMPT}
-The context below is labelled with source numbers like [1], [2], etc.
-You MUST cite sources inline in your answer using these numbers, e.g. "The project started in 2022 [1]."
 
-CITATION RULES:
-- Place the citation number immediately after the fact it supports, e.g. "Sales rose 20% [2]."
-- Use multiple citations if a fact comes from more than one source, e.g. [1][3].
-- Every factual sentence must have at least one citation.
-- If information is missing from all sources, say exactly:
-  "The answer is not present in the provided sources."
+The context may contain information from multiple documents.
 
-SOURCES:
-{source_legend}
+RULES:
+- Combine relevant information across all documents
+- Do NOT ignore useful passages
+- Cite information exactly as written
+- If information is missing say:
+"The answer is not present in the provided sources."
 
 CONTEXT:
 {context}
@@ -549,11 +536,8 @@ CONTEXT:
 QUESTION:
 {question}
 
-FINAL ANSWER (with inline [N] citations):
+FINAL ANSWER:
 """
-
-
-
 def rerank_with_cross_encoder(question, docs):
     if not docs:
         return docs
@@ -676,6 +660,7 @@ def build_memory_context():
         memory_text += f"Assistant: {turn['answer']}\n"
     
     return memory_text + "\n"
+
 def build_context(docs):
     parts = []
     filtered_docs = []
@@ -686,7 +671,7 @@ def build_context(docs):
             score = float(score)
         except:
             score = 0
-        threshold = 0.15 if d.get("type") == "image" else 0.50
+        threshold = 0.15 if d.get("type") == "image" else 0.35
         if score > threshold:
             filtered_docs.append(d)
 
@@ -708,6 +693,7 @@ def build_context(docs):
         parts.append(f"{src}\n{d.get('snippet', '')}")
 
     return "\n\n".join(parts), source_map  # ← NOW returns tuple
+
 def is_image_query(q):
     keywords = ["image", "screenshot", "photo", "picture"]
     return any(k in q.lower() for k in keywords)
@@ -926,41 +912,56 @@ def get_document(filename: str):
     return {"error": "File not found"}
 
 def rewrite_query_with_memory(question: str, model_choice: str):
-    pronouns = [" it ", " its ", " they ", " them ", " their ", " this ", " that "]
-    q_lower = " " + question.lower() + " "
-    has_pronoun = any(p in q_lower for p in pronouns)
-
-    # Fast mode: no LLM rewrite, but still do simple pronoun resolution
+    """
+    Rewrite only if question contains pronouns referring to previous topic.
+    """
+    
     if model_choice == "fast":
-        if has_pronoun and conversation_memory:
+        return question
+
+    pronouns = [" it ", " its ", " they ", " them ", " their ", " this ", " that "]
+
+    q_lower = " " + question.lower() + " "
+
+    if not any(p in q_lower for p in pronouns):
+        return question  # No rewrite needed
+    if model_choice == "fast":
+        # Simple substitution without LLM: prepend last topic
+        if conversation_memory:
             last_q = conversation_memory[-1]["question"]
-            return f"{question} (regarding: {last_q})"
+            return f"{question} (in context of: {last_q})"
         return question
-
-    # Smart/Llama modes: no pronoun → no rewrite needed
-    if not has_pronoun:
-        return question
-
     if not conversation_memory:
         return question
 
-    # Find most similar past question via embedding
-    current_vec = embed(question)
+    # Find most similar past question
     best_q = None
     best_sim = 0
+
+    current_vec = embed(question)
+
+    best_q = None
+    best_sim = 0
+
+    current_vec = embed(question)
 
     for turn in conversation_memory:
         past_vec = turn.get("embedding")
         if past_vec is None:
             continue
+
         sim = cosine_similarity(current_vec, past_vec)
+
         if sim > best_sim:
             best_sim = sim
             best_q = turn["question"]
 
+    # AFTER LOOP
     if best_sim < 0.3:
         conversation_memory.clear()
         return question
+
+    last_question = best_q
 
     rewrite_prompt = f"""
 You rewrite follow-up questions into fully standalone questions.
@@ -968,7 +969,7 @@ You rewrite follow-up questions into fully standalone questions.
 ONLY rewrite if the question depends on the previous topic.
 
 Previous Question:
-{best_q}
+{last_question}
 
 Current Question:
 {question}
@@ -977,6 +978,7 @@ Rewrite the current question so it is fully self-contained.
 Return ONLY the rewritten question.
 If not dependent, return the original question.
 """
+
     rewritten = call_llm(rewrite_prompt, model_choice)
 
     if not isinstance(rewritten, str):
@@ -986,66 +988,7 @@ If not dependent, return the original question.
         return rewritten.strip()
 
     return question
-def build_linked_sources(retrieved_docs):
-    # Separate by modality using unique file paths only
-    text_files  = list(dict.fromkeys(
-        d.get("path") for d in retrieved_docs
-        if d.get("type") not in {"image"} and not str(d.get("path","")).endswith((".mp3",".wav",".m4a",".png",".jpg",".jpeg"))
-    ))
-    audio_files = list(dict.fromkeys(
-        d.get("path") for d in retrieved_docs
-        if str(d.get("path","")).endswith((".mp3",".wav",".m4a"))
-    ))
-    image_files = list(dict.fromkeys(
-        d.get("path") for d in retrieved_docs
-        if d.get("type") == "image" or str(d.get("path","")).endswith((".png",".jpg",".jpeg"))
-    ))
 
-    # Helper: get best timestamp for an audio file from retrieved docs
-    def get_timestamp(audio_path):
-        for d in retrieved_docs:
-            if d.get("path") == audio_path and d.get("timestamp") is not None:
-                return d["timestamp"]
-        return None
-
-    # Helper: get best page for a text file
-    def get_page(text_path):
-        for d in retrieved_docs:
-            if d.get("path") == text_path and d.get("page") is not None:
-                return d["page"]
-        return None
-
-    links = []
-
-    for t in text_files:
-        for a in audio_files:
-            links.append({
-                "type": "text↔audio",
-                "text_source": t,
-                "text_page": get_page(t),
-                "audio_source": a,
-                "audio_timestamp": get_timestamp(a),
-            })
-
-    for t in text_files:
-        for img in image_files:
-            links.append({
-                "type": "text↔image",
-                "text_source": t,
-                "text_page": get_page(t),
-                "image_source": img,
-            })
-
-    for a in audio_files:
-        for img in image_files:
-            links.append({
-                "type": "audio↔image",
-                "audio_source": a,
-                "audio_timestamp": get_timestamp(a),
-                "image_source": img,
-            })
-
-    return links
 # ================= QUERY =================
 
 @app.post("/query")
@@ -1053,51 +996,42 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
 
     model = model.strip().lower()
 
+    # -------- ADAPTIVE RETRIEVAL DEPTH --------
+    #k_value = k
+
     # -------- MEMORY-AWARE QUERY REWRITE --------
     rewritten_q = rewrite_query_with_memory(q, model)
+
     print(f"\n🧠 Original: {q}")
     print(f"🔎 Rewritten: {rewritten_q}\n")
 
     # -------- RETRIEVAL --------
     docs = hybrid_search(rewritten_q, k=k)
-
     # -------- REMOVE WEAK MATCHES --------
-    docs = [d for d in docs if float(d.get("score", 0)) > 0.50]
+    filtered_docs = []
+
+    for d in docs:
+        score = d.get("score", 0)
+        try:
+            score = float(score)
+        except:
+            score = 0
+
+        if score > 0.35:
+            filtered_docs.append(d)
+
+    docs = filtered_docs
+
 
     # -------- SORT --------
     docs = sorted(docs, key=lambda x: x.get("score", 0), reverse=True)
-    print("Retrieved docs:", len(docs))
 
-    # -------- TOPIC SHIFT DETECTION --------
+    print("Retrieved docs:", len(docs))
+    # -------- TOPIC SHIFT DETECTION (AFTER docs exist) --------
     if detect_topic_shift_by_file(docs):
         print("🔄 Topic shift detected → clearing memory")
         conversation_memory.clear()
 
-    # -------- DOMINANT FILE FILTER --------
-    if docs:
-        # Find the highest score across all docs
-        top_score = docs[0].get("score", 0)  # already sorted descending
-
-        # Find which file owns the top score
-        dominant_file = docs[0].get("path")
-
-        # Keep dominant file always; keep others only if their BEST chunk
-        # is within 10% of the top score (tight gap)
-        file_best_score = {}
-        for d in docs:
-            p = d.get("path")
-            file_best_score[p] = max(file_best_score.get(p, 0), d.get("score", 0))
-
-        file_chunk_counts = Counter(d.get("path") for d in docs)
-        
-        docs = [
-            d for d in docs
-            if d.get("path") == dominant_file
-            or (
-                file_best_score.get(d.get("path"), 0) >= top_score * 0.92
-                and file_chunk_counts.get(d.get("path"), 0) >= file_chunk_counts.get(dominant_file, 1)
-            )
-        ]
     if not docs:
         return {
             "answer": "The answer is not present in the provided sources.",
@@ -1106,25 +1040,40 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
             "chunks_used": 0
         }
 
+    
+
     # -------- RERANK (SMART MODE ONLY) --------
     if model in ["mistral", "llama3"]:
         docs = rerank_with_cross_encoder(q, docs)
 
-    docs = docs[:6]
-    retrieved_docs = docs.copy()
+    # -------- MULTI-DOCUMENT REASONING FILTER --------
+    # keep top 2 documents but allow multiple files
+    if len(docs) > 6:
+        docs = docs[:6]
 
+    # ensure we don't take too many chunks from one file
+    # prioritize dominant file
+    #file_counts = {}
+    #filtered = []
+
+    # find most frequent file in results
+    # ---------- STRICT DOCUMENT FILTER ----------
+    docs = docs[:6]
+    retrieved_docs = docs.copy()  # for trace
     # -------- SEMANTIC WINDOW --------
     docs = build_semantic_section(docs, window=1)
 
-    # -------- BUILD CONTEXT + SOURCE MAP --------
-    context, source_map = build_context(docs)   # ← tuple unpack
-    memory_context = build_memory_context()
+    context, source_map = build_context(docs)
 
-    # Build sources list for prompt legend
+    # Build sources list for the prompt legend
     sources = [
         {"num": num, "path": path, "page": page}
-        for (path, page), num in sorted(source_map.items(), key=lambda x: x[1])  # type: ignore
+        for (path, page), num in sorted(source_map.items(), key=lambda x: x[1])
     ]
+
+    memory_context = build_memory_context()
+
+    
 
     # -------- CONFIDENCE CALC --------
     if model in ["mistral", "llama3"]:
@@ -1136,15 +1085,23 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
         confidence = 0
     else:
         avg_score = sum(scores) / len(scores)
+
         if len(docs) < 2:
             avg_score *= 0.85
-        if np.var(scores) > 0.15:
+
+        variance = np.var(scores)
+
+        if variance > 0.15:
             avg_score *= 0.9
-        # Normalize ALL models to 0–100
+
+        # Normalize ALL models to 0–100 scale
         if model in ["mistral", "llama3"]:
+            # cross-encoder scores are roughly -10 to +10; map to 0–100
             confidence = round(min(max((avg_score + 10) / 20 * 100, 0), 100), 1)
         else:
             confidence = round(avg_score * 100, 1)
+    # -------- TOKEN SAFE TRUNCATION --------
+    
 
     # -------- TOKEN SAFE TRUNCATION --------
     if model == "fast":
@@ -1158,7 +1115,7 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
     if is_list_question(q):
         prompt = build_list_prompt(memory_context + context, q)
     else:
-        prompt = build_prompt(memory_context + context, q, sources)
+        prompt = build_prompt(memory_context + context, q)
 
     # -------- LLM CALL --------
     raw_answer = call_llm(prompt, model)
@@ -1166,7 +1123,11 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
     # -------- LIST CLEANUP --------
     if is_list_question(q):
         items = extract_list_items(raw_answer)
-        answer = "\n\n".join(f"• {i}" for i in items) if items else "The answer is not present in the provided sources."
+
+        if items:
+            answer = "\n\n".join(f"• {i}" for i in items)
+        else:
+            answer = "The answer is not present in the provided sources."
     else:
         answer = clean_answer(raw_answer)
 
@@ -1179,32 +1140,28 @@ async def query(q: str = Form(...), model: str = Form("fast"), k: int = Form(8))
     })
     if len(conversation_memory) > MAX_MEMORY_TURNS:
         conversation_memory.pop(0)
-
     # -------- TRACE --------
-    trace = [
-        {
+    trace = []
+    for d in docs:
+        trace.append({
             "file": d.get("path"),
             "page": d.get("page"),
             "chunk_id": d.get("chunk_id"),
             "score": round(d.get("score", d.get("llm_score", 0)), 3)
-        }
-        for d in docs
-    ]
+        })
 
     return convert_numpy({
         "answer": answer,
         "citations": retrieved_docs,
         "confidence": confidence,
         "chunks_used": len(docs),
-        "trace": trace,
-        "linked_sources": build_linked_sources(retrieved_docs) 
+        "trace": trace
     })
-
-
 @app.post("/reset")
 def reset_memory():
     conversation_memory.clear()
     return {"status": "Conversation memory cleared"}
+
 
 @app.post("/image_query")
 async def image_query(file: UploadFile = File(...)):
@@ -1250,8 +1207,8 @@ async def image_query(file: UploadFile = File(...)):
     # Sort all results by score descending
     results = sorted(results, key=lambda x: x["score"], reverse=True)
 
-    return {"results": results}
-    
+    return {"results": results}   
+
 @app.get("/query")
 def query_get():
     return {"error": "Use POST /query with form data: q, model, k"}
